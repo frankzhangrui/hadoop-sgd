@@ -1,0 +1,47 @@
+/*
+ * Aggregate diagnostic events into features of patient and generate training, testing data
+ * for martality prediction.
+ */
+
+-- register a python UDF for converting data into SVMLight format
+REGISTER utils.py USING jython AS utils;
+
+-- load ICD9 code to index map
+featurename2id = LOAD 'ICD9_FEATURE_MAP.csv' USING PigStorage(',') as (index:int, icd9code:chararray);
+
+-- load diagnostic events. each event is represented by an ICD9 code
+diagnostics = LOAD 'ICD9EVENT.csv' USING PigStorage(',') as (patientid:chararray, icd9code:chararray, diagnosticdate:int);
+
+-- join diagnotics and feature name index. then drop unrelated fields
+diagnosticswithid = JOIN diagnostics BY icd9code, featurename2id BY icd9code;
+diagnosticswithid = FOREACH diagnosticswithid GENERATE $0 as patientid, $3 as featureid;
+
+-- aggregate events into features. each patient may have same diagnostics several times, count that 
+-- as feature value
+grpd = GROUP diagnosticswithid BY (patientid, featureid);
+--STORE grpd INTO 'grpd1' USING PigStorage(' ');
+features = FOREACH grpd GENERATE group.patientid, group.featureid, COUNT(group) as featurevalue;
+STORE features INTO 'features1' USING PigStorage(' ');
+-- aggregate features of same patient together in sparse format
+grpd = GROUP features BY patientid;
+STORE grpd INTO 'grpd2' USING PigStorage(' ');
+features = FOREACH grpd {
+    sorted = ORDER features BY featureid;
+    generate group as patientid, utils.bag_to_svmlight(sorted) as sparsefeature;
+}
+STORE features INTO 'features2' USING PigStorage(' ');
+
+-- join features and prediction target to form the samples for training and tesing
+target = LOAD 'MORTALITYEVENT.csv' USING PigStorage(',') as (patientid:chararray, date:int, label:int);
+samples = JOIN target BY patientid, features BY patientid;
+STORE samples INTO 'samples' USING PigStorage(' ');
+-- randomly split data for training and testing
+samples = FOREACH samples GENERATE $2 AS label, $4 AS sparsefeature;
+samples = FOREACH samples GENERATE RANDOM() as assignmentkey, *;
+SPLIT samples INTO testing IF assignmentkey <= 0.20, training OTHERWISE;
+training = FOREACH training GENERATE $1..;
+testing = FOREACH testing GENERATE $1..;
+
+-- save training and tesing data
+STORE testing INTO 'testing' USING PigStorage(' ');
+STORE training INTO 'training' USING PigStorage(' ');
